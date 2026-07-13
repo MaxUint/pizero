@@ -123,9 +123,9 @@ swapped, `bgr` is the knob.
 - Overlay extracted from the official Waveshare **"3.5inch RPi LCD (A)"**
   pre-installed image `3.5inch RPi LCD (A)_20220404_32bit_bullusye.img`
   (Bullseye 32-bit, 2022-04-04), Google Drive link on
-  <https://www.waveshare.com/wiki/3.5inch_RPi_LCD_(A)>. A copy of the image
-  zip is archived as a **GitHub Release asset** on this repo in case that
-  link ever dies.
+  <https://www.waveshare.com/wiki/3.5inch_RPi_LCD_(A)>. The image itself is
+  **not needed** to use this repo — everything relevant was extracted into
+  `waveshare35a.dtbo` and this README.
 - `waveshare35a.dts` is the dtc decompile of the dtbo (compile back with
   `dtc -I dts -O dtb -o waveshare35a.dtbo waveshare35a.dts` if ever needed).
 - Full investigation history (probing, eliminated protocols, KeDei
