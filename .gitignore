@@ -2,3 +2,4 @@
 boot.fat
 interfaces
 wpa_supplicant.conf
+*.zip
