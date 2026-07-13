@@ -13,14 +13,12 @@ what it's about to do, waits for ENTER, does it, and asks what you saw.
 Type what you saw (ENTER alone = "no change").
 
 The plan adapts:
-  T1  cold reproduction of the exact sequence that blinked (v5+v6.3)
-  ├─ no change → TB2 SCLK-idle/mode-3 artifact test → (exhausted: report)
-  └─ change    → T2 v6.3 alone from cold
-        ├─ works → T4 characterize (colors/bands/persistence/windowing)
-        │          then T5..T8 wedge bisection (bulk / 32MHz / mode0 / touch)
-        └─ dead  → T3 v5 alone from cold
-              ├─ works → T4..T8 with v5 as baseline
-              └─ dead  → T9 minimal-preamble bisect (wake bytes + v6.3)
+  T1  cold: ONLY the four v6.3 phases that actually blinked
+  ├─ change → proto=v63 → T4 characterize (colors/bands/persistence/window)
+  │           then T5..T8 wedge bisection (bulk / 32MHz / mode0 / touch)
+  └─ dead   → T2 full original sequence (v5 preamble + v6.3)
+        ├─ change → T3 v5 alone, then T9 minimal-preamble bisect
+        └─ dead   → TB2 SCLK-idle/mode-3 artifact test → (exhausted: report)
 """
 import ctypes, fcntl, json, os, subprocess, sys, time
 
@@ -202,11 +200,13 @@ class V63(Kedei):
 def baseline_black(proto):
     if proto == "v5":
         v = V5(0); v.resetbytes(); v.init(); v.fill(0x0000); v.close()
-    else:                      # "v63" or "v63p" (with wake preamble)
+    else:                      # "v63" / "v63p" (wake bytes) / "v63full" (v5 preamble)
         if proto == "v63p":
             for cs in (0, 1):
                 w = Kedei(cs); w.units([b"\x00"]); time.sleep(0.15)
                 w.units([b"\x01"]); time.sleep(0.25); w.close()
+        elif proto == "v63full":
+            v = V5(0); v.resetbytes(); v.init(); v.close()
         k = V63(0, mode=3); k.magic(); k.init(); k.fill(0x0000); k.close()
 
 def fake_touch_traffic():
@@ -221,6 +221,20 @@ def fake_touch_traffic():
 # each test = (title, [ (phase_label, phase_fn) ... ] ) built lazily
 
 def phases_T1():
+    """Cold boot: ONLY the four phases that produced taps in blink.py,
+    in the same order, plus two bonus phases if it turns out alive."""
+    S = {}
+    return [
+        ("v63 CE0 m3: magic+init", lambda: (S.setdefault("c", V63(0, mode=3)).magic(), S["c"].init())),
+        ("v63 CE0 m3: fill BLACK", lambda: S["c"].fill(0x0000)),
+        ("v63 CE1 m3: magic+init", lambda: (S.setdefault("d", V63(1, mode=3)).magic(), S["d"].init())),
+        ("v63 CE1 m3: fill BLACK", lambda: (S["d"].fill(0x0000), S["d"].close())),
+        ("bonus - v63 CE0: fill RED (blue => BGR)", lambda: S["c"].fill(0xF800)),
+        ("bonus - v63 CE0: 8 color bands", lambda: (S["c"].bands(), S["c"].close())),
+    ]
+
+def phases_T2():
+    """Full original blink.py sequence: v5 preamble then v6.3 (both CS)."""
     S = {}
     return [
         ("v5 CE0: reset bytes",  lambda: S.setdefault("a", V5(0)).resetbytes()),
@@ -235,16 +249,6 @@ def phases_T1():
         ("v63 CE0 m3: fill BLACK", lambda: (S["c"].fill(0x0000), S["c"].close())),
         ("v63 CE1 m3: magic+init", lambda: (S.setdefault("d", V63(1, mode=3)).magic(), S["d"].init())),
         ("v63 CE1 m3: fill BLACK", lambda: (S["d"].fill(0x0000), S["d"].close())),
-    ]
-
-def phases_T2():
-    S = {}
-    return [
-        ("v63 CE0 m3: magic units only", lambda: S.setdefault("k", V63(0, mode=3)).magic()),
-        ("v63 CE0 m3: init commands",    lambda: S["k"].init()),
-        ("v63 CE0 m3: fill BLACK",       lambda: S["k"].fill(0x0000)),
-        ("v63 CE0 m3: fill RED",         lambda: S["k"].fill(0xF800)),
-        ("v63 CE0 m3: 8 color bands",    lambda: (S["k"].bands(), S["k"].close())),
     ]
 
 def phases_T3():
@@ -296,8 +300,8 @@ def phases_wedge(proto, poke_label, poke_fn):
     ]
 
 def build_test(tid, proto):
-    if tid == "T1": return ("cold repro of the exact blink sequence", phases_T1())
-    if tid == "T2": return ("v6.3 ALONE from cold boot", phases_T2())
+    if tid == "T1": return ("cold: ONLY the v6.3 phases that blinked", phases_T1())
+    if tid == "T2": return ("cold: FULL original sequence (v5 preamble + v6.3)", phases_T2())
     if tid == "T3": return ("v5 ALONE from cold boot", phases_T3())
     if tid == "T9": return ("minimal preamble bisect (wake bytes / v5-init + v6.3)", phases_T9())
     if tid == "T4": return ("characterization: colors, bands, persistence, windowing", phases_T4(proto))
@@ -332,22 +336,19 @@ def choose(st):
     o = st["outcomes"]
     def obs(t): return o.get(t, {}).get("observed")
     if "T1" not in o: return "T1"
-    if not obs("T1"):
-        if "TB2" not in o: return "TB2"
-        return None
-    if "T2" not in o: return "T2"
-    if obs("T2"):
+    if obs("T1"):
         st["proto"] = st["proto"] or "v63"
     else:
+        if "T2" not in o: return "T2"
+        if not obs("T2"):
+            if "TB2" not in o: return "TB2"
+            return None
         if "T3" not in o: return "T3"
         if obs("T3"):
             st["proto"] = st["proto"] or "v5"
         else:
             if "T9" not in o: return "T9"
-            if obs("T9"):
-                st["proto"] = st["proto"] or "v63p"
-            else:
-                return None
+            st["proto"] = st["proto"] or ("v63p" if obs("T9") else "v63full")
     for t in ("T4", "T5", "T6", "T7", "T8"):
         if t not in o: return t
     return None
