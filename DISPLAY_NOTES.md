@@ -3,7 +3,114 @@
 Investigation log for getting a 3.5" 480×320 SPI touch display working on
 a Raspberry Pi Zero W (host `pocket`, normally `zom@pocket.local`).
 
-Last updated: 2026-07-13 — **MILESTONE: screen responds to vendor LCD (A) image**
+Last updated: 2026-07-13 — **MILESTONE 3: driver PORTED — trixie card drives
+the panel natively (login terminal on glass, confirmed by eye)**
+
+---
+
+## ★★★ PORTED TO TRIXIE (session 3, final) — the pocket card works
+
+Done entirely over ssh (`zom@pocket.local`) with the user confirming on glass.
+Runtime `dtoverlay /tmp/waveshare35a.dtbo` probed instantly on 6.18.34 —
+identical dmesg signature to the vendor image (fb_ili9486, 480x320, 16 MHz),
+console appeared on the LCD. Then made persistent:
+
+- `/boot/firmware/overlays/waveshare35a.dtbo` ← the vendor dtbo
+  (md5 d46683bf262ffa1b532851590a96907c, also in git at
+  `8f29aa4:tools/waveshare35a-vendor.dtbo`)
+- `/boot/firmware/config.txt`: `dtoverlay=waveshare35a` under `[all]`
+  (backup: config.txt.bak.20260713-0950)
+- `/boot/firmware/cmdline.txt`: appended `fbcon=map:1`
+  (backup: cmdline.txt.bak.*)
+
+**Gotchas found while porting (trixie/KMS specifics):**
+- With `vc4-kms-v3d` present, vc4 claims fb0 early, so the LCD registers as
+  **fb1**; headless, vc4 later unregisters fb0 and fbcon falls back to the
+  dummy console → black (initialized but consoleless) screen. `fbcon=map:1`
+  fixes it at boot (fbcon grabs fb1 when it registers).
+- Live remap without reboot: `con2fbmap N 1` hardcodes /dev/fb0 and fails
+  when fb0 is gone — temporary `ln -sf /dev/fb1 /dev/fb0` lets the ioctl
+  through; then `echo 1 > /sys/class/vtconsole/vtcon1/bind` makes fbcon
+  actually take over ("Console: switching to colour frame buffer device").
+- Pixel-path smoke test: `cat /dev/urandom > /dev/fb1` → static on glass.
+- Touch (ads7846) probes on spi0.1 as an input device out of the box.
+- Note `bgr = <0x00>` triggers a 6.18 warning ("boolean property with a
+  value") — harmless, colors TBC; if red/blue swap shows up, that's where
+  to look.
+
+**Remaining for the end-goal:** X11 + i3 on fb1 (xserver-xorg-video-fbdev,
+`Option "fbdev" "/dev/fb1"`), touch calibration (vendor X calib was
+`3932 300 294 3801` + SwapAxes=1 — see extraction section), optional
+console font tuning (vendor used `fbcon=font:ProFont6x11`).
+
+---
+
+## ★★ DRIVER EXTRACTED (session 3) — full ground truth
+
+The vendor image now boots to a **fully working display**. User enabled
+ssh/wifi + set hostname → `root@pocket.local` / `pi@pocket.local` reachable
+(keys installed via tools/installKeys.sh). Everything below is read from the
+**live running system**, not guessed.
+
+### Kernel driver (the actual "display driver")
+- **fbtft `fb_ili9486`** (stock staging module, kernel 5.15.32+) bound to
+  **spi0.0 at 16 MHz** → `graphics fb1: 480x320, fps=33` (see
+  `tools/vendor-image-dmesg-probe.txt` for the probe log).
+- Overlay-provided params: `regwidth=16, buswidth=8, rotate=90, bgr=0,
+  fps=30, txbuflen=32768, debug=0`.
+- Pins: **dc = GPIO24, reset = GPIO25 active-low** (pinctrl claims 17/25/24)
+  — *exactly what we fired blind*. The delta was never the wiring.
+- Touch: `ads7846` on **spi0.1 @ 50 kHz** (yes, 0xC350 = 50000 — far slower
+  than the 2 MHz in goodtft overlays), PENIRQ GPIO17 active-low,
+  x-plate-ohms=20, pressure-max=255, `swapxy` exposed as an override.
+- Running overlay md5 `d46683bf262ffa1b532851590a96907c` == our archived
+  `tools/waveshare35a-vendor.dtbo` — same file, now **decompiled** to
+  `tools/waveshare35a-vendor.dts` (via dtc on the Pi itself).
+
+### THE MAGIC: vendor init sequence (decoded from the dtbo `init` property)
+```
+B0 00                    Interface Mode Control = 0
+11                       Sleep Out
+   delay 255 ms
+3A 55                    COLMOD: 16 bpp
+36 28                    MADCTL: MV|BGR (landscape)
+C2 44                    Power Control 3
+C5 00 00 00 00           VCOM Control
+E0 0F 1F 1C 0C 0F 08 48 98 37 0A 13 04 11 0D 00   pos. gamma
+E1 0F 32 2E 0B 0D 05 47 75 37 06 10 03 24 20 00   neg. gamma
+E2 0F 32 2E 0B 0D 05 47 75 37 06 10 03 24 20 00   digital gamma (= E1)
+36 28                    MADCTL again
+11                       Sleep Out again
+29                       Display On
+```
+With regwidth=16 fbtft emits every command/parameter as a 16-bit word
+(0x00XX) — the FPGA expects that framing. Differences vs the failed MHS35-family
+blind inits: presence of `B0`, the `E2` digital-gamma write, doubled `36`/`11`,
+different power/VCOM values (`C2 44`, zeroed `C5`), and no `C0`/`C1`/`F`-series
+extended commands. Any (or all) of these are what the FPGA's command parser
+requires before it unlatches.
+
+### Display pipeline on the vendor image (IMPORTANT — it's fbcp!)
+- `config.txt`: `dtoverlay=waveshare35a` + `hdmi_force_hotplug` +
+  `hdmi_cvt 480 320 60` → **fb0 (HDMI/dispmanx) is also 480×320**.
+- cmdline: `fbcon=map:10` initially maps consoles to fb1, **but**
+  `/etc/rc.local` (archived: `tools/vendor-image-rc.local`) then runs
+  **`fbcp &`** (dispmanx fb0 → fb1 mirror, ~25 fps) and **`con2fbmap 1 0`**
+  (tty1 back onto fb0). Net effect: everything renders to fb0 and fbcp
+  mirrors it to the panel. The armv6 binary is archived as
+  `tools/vendor-fbcp-armv6.bin` (13 kB, /usr/local/bin/fbcp).
+- X11: fbturbo driver on **/dev/fb0** (`tools/vendor-image-99-fbturbo.conf`);
+  touch calibrated in `tools/vendor-image-99-calibration.conf`
+  (`Calibration "3932 300 294 3801"`, `SwapAxes 1`, third-button emulation).
+
+### Consequences for the trixie port (plan 4b)
+- The kernel side ports cleanly: drop `waveshare35a-vendor.dtbo` into
+  `/boot/firmware/overlays/waveshare35a.dtbo`, add `dtoverlay=waveshare35a`
+  + `fbcon=map:10` — fb_ili9486 exists on 6.18 and reads the same properties.
+- **fbcp does NOT port**: it needs legacy dispmanx, which is gone under
+  KMS/6.18. On trixie either run X/console directly on fb1 (fbdev), or skip
+  fbcp entirely — for the i3 goal, X on fb1 via xserver-xorg-video-fbdev is
+  the straight path.
 
 ---
 
@@ -57,13 +164,12 @@ reproducible screen response of the entire investigation.
   `pi:$(openssl passwd -6 raspberry)`).
 
 ## NEXT SESSION PLAN
-1. Confirm the vendor image boots to a console ON the LCD (fbcon=map:10 → login
-   prompt should appear on the glass). If yes: hardware + driver fully proven.
-2. Enable ssh/wifi on the vendor card (boot partition edits above) → get into
-   the LIVE working system: `dmesg` (fbtft probe messages show driver, speed,
-   pins!), `lsmod`, `/proc/device-tree` — full ground truth.
-3. Decompile `tools/waveshare35a-vendor.dtbo` → diff against everything we
-   fired blind (see "eliminated" below) → identify the magic delta.
+1. ~~Confirm the vendor image boots to a console ON the LCD~~ **DONE — full
+   working display (session 3).**
+2. ~~Enable ssh/wifi, get into the live system~~ **DONE — ground truth
+   extracted, see "DRIVER EXTRACTED" above.**
+3. ~~Decompile the dtbo~~ **DONE — `tools/waveshare35a-vendor.dts`; magic
+   delta = init sequence content (see decode above).**
 4. Decide end-state architecture, either:
    a. **Adopt the vendor image** as the OS (Bullseye 32-bit runs i3 fine on a
       Zero W) — least work, or
@@ -123,8 +229,14 @@ drive1/drive2.py (DBI sweeps + test cards), sweep.py (18-candidate live sweep),
 blink.py (minimal v6.3 tap test), charact*.py (self-paced state tests),
 primer.py (precondition bisect), soak.py (15-min loop + wiggle test),
 boottest.py (per-boot adaptive test runner with state in ~/display_tests),
-kedei_v62.c, overlays: waveshare35a-vendor.dtbo ★, mhs35/mhs35ips dtbo,
-vendor-image-config.txt ★, vendor-image-cmdline.txt ★.
+kedei_v62.c, overlays: waveshare35a-vendor.dtbo ★ + waveshare35a-vendor.dts ★
+(decompiled), mhs35/mhs35ips dtbo, vendor-image-config.txt ★,
+vendor-image-cmdline.txt ★, vendor-image-dmesg-probe.txt ★ (live fbtft probe),
+vendor-image-rc.local ★ (fbcp + con2fbmap), vendor-fbcp-armv6.bin,
+vendor-image-99-fbturbo.conf / 99-calibration.conf (X11 fb0 + touch calib),
+card-prep helpers: saveWifi.sh (repo root), addWifi.sh, installWifi.sh,
+interfaces2wpa.sh, installKeys.sh, setHostname.sh, lockSecrets.sh
+(secrets `interfaces`/`wpa_supplicant.conf` are root-only + gitignored).
 
 ## Strategic notes for the i3 end-goal
 - fbtft/fbdev path (no DRM). X via fbdev on fb1; i3 static tiling is a good fit
