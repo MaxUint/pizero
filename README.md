@@ -9,6 +9,13 @@ overlay drives it. **The two files that matter are `waveshare35a.dtbo`
 Verified working 2026-07-13 on Raspberry Pi OS trixie (kernel 6.18.34+rpt-rpi-v6,
 armv6l) and on the vendor Bullseye image (5.15.32+).
 
+> **Found this by searching?** If your board's silkscreen says
+> **"3.5 inch Display-G / 480x320 / SPI 180MHz / XPT2046"** — a 26-pin
+> top-mount HAT with a fan and a Gowin GW1NZ-LV1 FPGA — and you're getting a
+> **white screen** that no LCD-show script, goodtft/tft35a overlay, KeDei
+> protocol, MHS35 init, or generic ILI9486/ST7796 recipe will light up:
+> this repo is your answer. Use `waveshare35a.dtbo` from here and read on.
+
 ## The hardware (identified)
 
 - 26-pin **top-mount** HAT with fan. Silkscreen: *"3.5 inch Display-G /
