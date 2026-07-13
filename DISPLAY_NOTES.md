@@ -3,159 +3,154 @@
 Investigation log for getting a 3.5" 480×320 SPI touch display working on
 `zom@pocket.local`.
 
-Last updated: 2026-07-12 (evening session — empirical SPI/pin probing + protocol identification)
+Last updated: 2026-07-13 (KeDei v6.3 blink evidence + suspected latched bad state)
 
 ## GOALS
-1. Get the 3.5" SPI display drawing pixels. **[Best-candidate recipe applied — awaiting one glance at the glass]**
-2. Get touch working. **[DONE — verified.]**
-3. End goal: **run i3 (X11 window manager)** on the display.
+1. Get the 3.5" SPI display drawing pixels. **[Blocked on suspected wedged FPGA/panel
+   state — power-cycle experiment pending, see PLAN]**
+2. Get touch working. **[Was verified working; ads7846 currently NOT loaded (removed
+   from boot config during debugging).]**
+3. End goal: **run i3 (X11)** on the display.
 
 ---
 
 ## Hardware — CONFIRMED FACTS
+- **Pi:** Raspberry Pi Zero W Rev 1.1 (armv6l), Raspbian 13 trixie, kernel 6.18.34+rpt-rpi-v6.
+  fbtft/fb_ili9486 modules present. SSH `zom@pocket.local`, passwordless sudo.
+  (Another machine sometimes squats old DHCP IPs — verify host key; pocket ≠ 192.168.1.153.)
+- **Display board:** silkscreen "3.5 inch Display-G", 480×320, "SPI 180MHz", XPT2046;
+  26-pin header (pins 1–26 confirmed by user photo); cooling fan; **Gowin GW1NZ-LV1
+  FPGA**, HR2046 touch clone, 3.3V+1.2V regs. Silkscreen may be copy-paste (knockoff).
+- Board sits on pins 1–26 only → available GPIOs: 2,3,4,7,8,9,10,11,14,15,17,18,22,23,24,25,27.
 
-### The Pi
-- **Board:** Raspberry Pi Zero W Rev 1.1 (BCM2835, single-core, **armv6l**)
-- **OS:** Raspbian 13 (trixie), kernel **6.18.34+rpt-rpi-v6** (fbtft + fb_ili9486 modules ARE present)
-- **Host:** `zom@pocket.local` (mDNS drops sometimes; was .170, DHCP may move it — scan `nmap -p22 192.168.1.0/24` and verify hostkey, careful: another box lives at .153)
-- SSH key auth + passwordless sudo working.
+## Electrical findings (probe2.py / probe3.py — solid, reproducible)
+1. **Display channel is write-only.** MISO is never driven during CE0 activity
+   (reads follow internal pulls exactly; touch on CE1 returns real data under both
+   pulls → bus + method sound). Register-read identification is impossible.
+2. **Pin scan:** GPIO24 = the ONLY externally-loaded control pin (pulled high)
+   besides PENIRQ 17. GPIO4/14/15/18/22/23/25/27 all float. GPIO18 idles low while
+   backlight is on → not an active-high BL. GPIO24 does not gate the backlight
+   (temp-channel rail test negative). GPIO24's role still unknown
+   (candidates: unused DC per MHS pinout, FPGA RECONFIG_N/DONE, BUSY).
+3. Backlight: hardwired on. Screen shows **pure uniform white** (user-inspected
+   closely: no banding/flicker/grey) whenever panel is uninitialized = gate drivers
+   never ran.
+4. Oracles that DON'T work on this board: TE-line scan (no TE routed), touch-ADC
+   coupling (plates rail-pinned), rail-sag via XPT2046 temp channel (too stiff).
+   **Only reliable oracle = human eyes on the glass.**
 
-### The display board (physically inspected; user cautions silkscreen may be a copy-paste)
-- Silkscreen: **"3.5 inch Display-G"**, "480 x 320 Pixel", "SPI 180MHz Support", "XPT2046".
-- 2×13 (26-pin) header; has a **cooling fan**.
-- ICs: **Gowin GW1NZ-LV1** FPGA (SPI→panel bridge), **HR2046** (XPT2046 clone), 3.3V + 1.2V regulators.
-
----
-
-## EMPIRICAL RESULTS — 2026-07-12 session (tools/probe2.py, probe3.py)
-
-### 1. Display channel is WRITE-ONLY (measured, decisive)
-MISO pull test: with internal pull-up all CE0 reads = 0xFF, with pull-down all = 0x00,
-while touch reads (CE1) return real data under both pulls.
-→ **Nothing ever drives MISO for the display. All register-read-based ID probing is
-impossible; historical "all-zero register reads" were measuring a pull resistor.**
-
-### 2. Pin connectivity scan (input + 50k internal pull, both directions)
-| GPIO | result |
-|------|--------|
-| 17 (PENIRQ) | externally pulled HIGH (real, touch works) |
-| **24** | **externally pulled HIGH — the ONLY loaded control pin besides 17** |
-| 4, 14, 15, 18, 22, 23, 25, 27 | floating (no external pull; could still be hi-Z FPGA inputs) |
-| 2, 3 | high (Pi's own hard I²C pull-ups, uninformative) |
-
-→ GPIO24 pull-up matches **lcdwiki/MHS-family DC line** (their overlays: dc=24, rst=25).
-→ Waveshare-G's claimed pins (dc=22, rst=27, bl=18) show NO electrical presence
-  (weak evidence against, not proof — FPGA inputs don't load pins).
-→ GPIO18 is NOT an active-high backlight (it idled LOW while screen stayed lit).
-
-### 3. Oracle attempts (all NEGATIVE = uninformative, not failure)
-- **Touch-ADC coupling** (black vs white fill → touch noise stats): no signal; plates rail-pinned.
-- **TE scan** (init each candidate with TE-on 0x35, sample all header GPIOs ~110k/s
-  via /dev/gpiomem): no pulses on any pin for any candidate. (Reference boards don't
-  route TE to the header, so silence was expected even on success.)
-- **GPIO24-backlight test** (drive 24 low, watch XPT2046 TEMP channel for rail sag): no shift
-  → 24 does not gate the backlight (or BL is on the stiff 5V rail).
-
-### 4. Protocol candidates fired blind (probe3.py — all silent, screen state unobserved)
-byte-DBI ST7796 (G recipe) mode0/mode3/CS-active-high; 16-bit-word DBI ILI9486+ST7796
-on both pin theories; KeDei v5 framing on CE0 and CE1; KeDei v6.3 framing (mode 3).
-
----
-
-## BOARD IDENTITY — best-supported theory
-
-**lcdwiki "MHS-3.5inch RPi Display-IPS" class**: an IPS 480×320 with **ST7796S behind a
-16-bit SPI→parallel bridge** (here implemented in the GW1NZ FPGA), lcdwiki pinout.
-
-Fingerprint evidence (`tools/mhs35ips-overlay.dtb`, from goodtft/LCD-show):
-- `regwidth = 16` → **every command/param goes as a 16-bit big-endian word** ({0x00, byte});
-  byte-framed writes (everything tried before today) get mangled by the bridge.
-- `dc-gpios = 24` (the one pulled-up pin!), `reset-gpios = 25` (active low), no BL gpio.
-- **Its init sequence is byte-identical to Waveshare's official G blob** (same F0 C3/96
-  unlocks, same gamma tables) → explains a "display-G" silkscreen on MHS-wired hardware.
-- IPS + high SPI clock marketing (115MHz there, "180MHz" here) both match.
-
-KeDei framing remains the fallback theory (v5: 2-byte units ctrl-bits 0x11/0x1B/0x15/0x1F,
-reset via 1-byte SPI writes 0x00/0x01, ILI9481 init; v6.3: 32-bit units {00 11 00 cmd} /
-{00 15 00 dat}, mode 3, HX8357-C init, display-on-CE1) — both were fired blind, sources
-cached in scratchpad (`kedei_v50_spidev.c`, `mpi3501.cpp/h`).
-
----
-
-## CURRENT STATE (as of end of session, NO reboot performed)
-
-- **The glass should now show**: 8 vertical color bars (white yellow cyan green magenta
-  red blue black) on the top ~2/3, black/white checkerboard below — painted twice via the
-  verbatim MHS35-IPS recipe (`tools/drive2.py`, 16-bit words, dc=24 rst=25, 24MHz mode 0).
-- **ONE GLANCE DECIDES**: test card visible → identity confirmed, activate the real driver
-  (below). Still white → MHS theory dead, go to fallbacks.
-- spi0.0 is left bound to **spidev** (panel-mipi-dbi deliberately NOT rebound, keeps bus quiet).
-- ads7846 rebound — **touch still works**.
-- GPIO24 (DC) and GPIO25 (RST) parked as outputs, high.
-- Boot config UNCHANGED (still the old mipi-dbi block). Reboot restores old (non-working)
-  panel-mipi-dbi state harmlessly.
-
-## ACTIVATE THE REAL DRIVER (once test card confirmed)
-Everything staged on the Pi:
-- `/boot/firmware/overlays/mhs35ips.dtbo` (fbtft: fb_ili9486, 16-bit regwidth, dc24/rst25,
-  built-in ads7846 node penirq=17)
-- `/boot/firmware/config.txt.mhs35ips` (current config with mipi-dbi + standalone ads7846
-  lines replaced by `dtoverlay=mhs35ips:rotate=90,speed=32000000,fps=30`)
-
-```sh
-sudo cp /boot/firmware/config.txt /boot/firmware/config.txt.bak.$(date +%s)
-sudo cp /boot/firmware/config.txt.mhs35ips /boot/firmware/config.txt
-sudo reboot   # slow — be patient
-# after boot: /dev/fb1 = 480x320; console: sudo con2fbmap 1 1
-# or add fbcon=map:1 to /boot/firmware/cmdline.txt for console-on-TFT at boot
+## Protocol findings — the KeDei v6.3 blink evidence
+User-observed, keyboard-timestamped (tools/blink.py, correlation table):
 ```
-Touch calibration params differ slightly from the old ads7846 line (overlay hardcodes
-x-plate-ohms=60); redo libinput calibration when X is up.
+key @ 63.61s -> during: v63 CE0 m3: magic+init
+key @ 67.10s -> during: v63 CE0 m3: fill BLACK
+key @ 74.98s -> during: v63 CE1 m3: magic+init
+key @ 78.35s -> during: v63 CE1 m3: fill BLACK
+(no taps during ANY KeDei v5 step, CE0 or CE1)
+```
+- Screen "blinked black a few times" — visible changes during **KeDei v6.3 framing**
+  (32-bit units {00 11 00 cmd}/{00 15 00 dat}, SPI mode 3, HX8357-C-ish init from
+  fbcp-ili9341 `mpi3501.cpp`), on **both CE0 and CE1** → FPGA appears CS-agnostic.
+- Same blinks seen in the preceding sweep re-run (KeDei-only steps).
+- **NOT reproducible since** (see timeline). Content never persisted to a stable image.
 
-## FALLBACKS if the glass is still white
-1. Variants within the MHS family: `mhs35` (real ILI9486 init incl. F1/F2/F8/F9 vendor
-   unlocks — tools/drive1.py A1), `mhs35b`, `mis35` (ILI9488-style init), `mhs395`
-   (ST7796 with 0x05 COLMOD) — all 16-bit dc24/rst25; overlays fetchable from
-   goodtft/LCD-show `usr/`.
-2. KeDei deep-dive: try LSB-first bit order, CS-active-high with kedei framings,
-   v6.3 on CE1-with-touch-displaced. Sources cached.
-3. **Hardware truth**: logic analyzer / scope on the flex or FPGA pins; or obtain the
-   seller's SD image (its /boot/config.txt + overlays contain the exact protocol).
-4. Consider board simply being defective (FPGA bitstream never configures): white +
-   working touch + total silence is also consistent with a dead display path.
+## What has been ELIMINATED on-glass (user watched / confirmed white after)
+- Official Waveshare G recipe (byte DBI ST7796S dc22/rst27) — kernel panel-mipi-dbi,
+  vendor blob, vendor python equivalent, at multiple speeds/modes; also CS-active-high,
+  mode 3, LSB-first byte variants.
+- 16-bit-word DBI (MHS35/mhs35ips/mhs35b/mis35/mhs395 style) on dc24/rst25 AND
+  dc22/rst27, incl. little-endian, LSB-first, DC-inverted, mode 3 variants.
+  The staged mhs35ips theory is DEAD on this board (drive2.py test card → still white).
+- 9-bit 3-wire DBI; raw dumb-framebuffer streams (CS-framed and CS-less, CE0/CE1);
+  KeDei v5 full sequences (never produced taps).
+
+## Session timeline (2026-07-12 → 13, one Pi boot, no power cycle!)
+1. probe2 (electrical) → write-only + pin scan findings.
+2. drive1 (5 DBI candidates + touch-ADC oracle) — unobserved, oracle null.
+3. probe3 (TE/BL oracles + 9 blind inits incl. KeDei inits WITHOUT fills) — silent.
+4. drive2 mhs35ips test card ×2 — later confirmed WHITE (theory dead).
+5. sweep run1 (18 steps; KeDei steps crashed EMSGSIZE — spidev caps multi-transfer
+   ioctl at 128 transfers/4096B of structs).
+6. sweep run2 (KeDei 11–14 fixed): **USER SAW BLINKS.**
+7. blink.py: keyboard correlation above — **v6.3 active on both CS.**
+8. charact.py (8 v6.3 states: fills, bands, BULK writes, mode-0 reinit, **32MHz bulk**,
+   touch-driver rebinds) — USER NOT WATCHING. Bulk timing: full-frame fill 1.0s vs 4.0s
+   pumped; 0.8s at 32MHz.
+9. Since then: EVERYTHING dead white — charact2 (v6.3 self-paced), charact3
+   (bisect incl. exact blink.py order: v5 CE0 full → v63 CE0 → v5 CE1 → v63 CE1,
+   wake-bytes variant) — **zero pixels, zero flicker**.
+
+## LEADING HYPOTHESIS — latched bad state (user's suggestion, evidence agrees)
+The FPGA (or panel behind it) entered a stuck state partway through the session and
+no longer reacts to anything, including previously-working sequences. Prime suspects,
+in order of when they first appeared between "blinks" (7) and "dead" (9):
+- **32MHz mode-3 bulk stream** (charact.py state 7) — most aggressive signal of the
+  whole session; could glitch FPGA input sampling/state machine.
+- Bulk writes generally (1024 units per CS frame instead of pumped CS) — if the FPGA
+  frames on CS edges, a 4096-byte frame is 1023 units of misalignment...
+- Mode-0 re-init among mode-3 traffic (SCLK idle level flips mid-session).
+- ads7846 driver rebinds + touch traffic — CS-agnostic FPGA swallows touch bytes as
+  garbage units (also a long-term coexistence concern!).
+- Panel-side: accidental SLPIN/DISPOFF/deep-standby from garbage — DSTB on many
+  controllers exits ONLY via hardware reset/power-cycle, and this board has no
+  reachable reset pin (KeDei resets in-band via SPI).
+Mechanisms like these are consistent with "correct commands stop working": state
+machines held mid-frame, panel bias/charge-pump shut down, deep standby.
+
+## PLAN — clean-state reproduction (NEXT ACTION, needs human at the hardware)
+1. Boot config has been CLEANED (2026-07-13): display + ads7846 overlays removed from
+   /boot/firmware/config.txt (backups: config.txt.bak.*). After reboot, NOTHING
+   touches SPI0 at boot → first bus traffic is whatever we choose.
+2. **FULL POWER CYCLE** (not just reboot — unplug Pi power, wait ~15s, replug).
+   Display is header-powered, so this hard-resets FPGA + panel.
+3. First and only traffic after boot: `sudo python3 ~/blink.py` (verbatim script that
+   produced the taps) with eyes on the glass.
+   - Blinks return → latched-state confirmed + v6.3 protocol re-confirmed.
+     Discipline from then on: ONE experiment per power cycle; bisect what wedges it
+     (32MHz? bulk? mode0? touch traffic?); characterize colors/windowing gently.
+   - Still dead → the original blinks need re-examination (H: mode-3 SCLK-idle
+     transitions, v5+v63 interaction, or observational artifact) — next step would be
+     re-running the EXACT sweep run-2 (steps 11–14) after another power cycle.
+4. Remember: reboots/power cycles are slow on this Pi and mDNS can drop — find it via
+   `nmap -p22 192.168.1.0/24` if pocket.local doesn't resolve.
+
+## Driver end-game (once protocol is stable)
+- fbcp-ili9341 `-DMPI3501=ON` implements KeDei v6.3 (needs legacy/dispmanx: remove
+  `dtoverlay=vc4-kms-v3d`; unknown if dispmanx userland still works on trixie/armhf).
+  NOTE: it owns SPI registers directly → CANNOT coexist with kernel ads7846; touch
+  would need polling or custom handling. Also expects display on CE1 (ours: either).
+- Alternative: custom userspace fbcp via spidev (bulk writes measured ~1 fps pumped,
+  ~4 fps bulk at 8MHz, faster at 32MHz — IF bulk mode is actually safe; it's also a
+  wedge suspect).
+- Touch coexistence on a CS-agnostic FPGA is an open design problem — touch SPI
+  traffic may corrupt display state; needs experiment (charact2 state 5/6 never ran
+  due to dead panel).
+
+## Current machine state (end of 2026-07-13 session)
+- /boot/firmware/config.txt: CLEAN (no display, no ads7846). Backups + staged
+  alternates: config.txt.bak.*, config.txt.mhs35ips (dead theory, kept for reference).
+- spi0.0/spi0.1: spidev bound at runtime (until reboot); ads7846 currently unbound →
+  **touch inactive**. Restore later by re-adding the ads7846 dtoverlay line.
+- Screen: white (uninitialized), backlight on.
+- Repo tools/: probe2, probe3, drive1, drive2, sweep, blink, charact, charact2,
+  charact3 + fetched overlays. On the Pi: same scripts in ~zom.
 
 ## Key resources
-- goodtft/LCD-show overlays (fetched, in tools/): mhs35ips, mhs35; also mhs35b/mis35/mhs395 in repo `usr/`.
-- fbcp-ili9341 (juj) — KeDei v6.3 = `mpi3501.cpp` (`-DMPI3501=ON`).
-- FREEWING-JP/RaspberryPi_KeDei_35_lcd_v50 — KeDei v5 userspace C.
-- Waveshare G wiki via Wayback (WebFetch blocked for archive.org; curl works).
-- Official Waveshare files (files.waveshare.com): St7796s.zip blob, G Python demo,
-  Waveshare-st7796s.zip (.ko for 6.1.21/6.6.51 — wrong kernel, and byte-framing anyway),
-  Waveshare35g.dtbo (fbtft st7796s dc22/rst27 96MHz — decoded, byte-framing family).
+- fbcp-ili9341 mpi3501.{cpp,h} = KeDei v6.3 reference (cached in scratchpad + tools).
+- FREEWING-JP/RaspberryPi_KeDei_35_lcd_v50 = v5 reference (cached).
+- goodtft/LCD-show overlays (mhs35, mhs35ips, mhs35b, mis35, mhs395) — decoded; all
+  16-bit dc24/rst25; eliminated on-glass.
+- Waveshare G official artifacts (blob, python demo, dtbo, .ko) — eliminated on-glass.
+- Product identity still unknown; seller listing/driver link would still be GOLD —
+  ask user to dig it up if possible.
 
-## Pin mapping (updated best knowledge)
+## Pin mapping (best current knowledge)
 | Signal | BCM GPIO | Evidence |
 |--------|----------|----------|
-| SPI0 SCLK/MOSI/MISO | 11/10/9 | bus proven via touch |
-| Display CS | 8 (CE0) | assumed; write-only, never ACKs |
-| Touch CS | 7 (CE1) | proven working |
-| **DC / RS** | **24** | external pull-up + all MHS-family overlays |
-| **RESET** | **25** (active low) | MHS-family overlays; electrically unconfirmed |
-| Touch PENIRQ | 17 | proven working |
-| Backlight | none/hardwired | GPIO18 ruled out; GPIO24-gate ruled out |
-
-## Touch — WORKING ✅ (unchanged)
-- `dtoverlay=ads7846,speed=2000000,penirq=17,...` → /dev/input/event0, verified via touchmon.py.
-- (If mhs35ips config activated, its built-in ads7846 node replaces this line.)
-
-## Tools (this repo, `tools/`)
-- `probe2.py` — spidev rebinding + MISO drive test + pin scan + protocol-correct register reads
-- `probe3.py` — TE-scan oracle (gpiomem high-rate sampler), GPIO24 BL test, 9-candidate blind sweep
-- `drive1.py` — 5-candidate sweep with touch-ADC oracle + distinct patterns per candidate
-- `drive2.py` — final verbatim MHS35-IPS recipe + color-bar/checkerboard test card
-- `mhs35ips-overlay.dtb`, `mhs35-overlay.dtb` — fetched lcdwiki overlays (also staged on Pi)
-
-## STRATEGIC CAVEAT (for the i3 goal) — unchanged
-fbtft fbdev only (no DRM/KMS); X on fb1 via fbdev driver; single-core armv6 will be
-sluggish but i3's static tiling is a decent fit. The panel-mipi-dbi DRM path is dead for
-this board (byte framing).
+| SPI0 SCLK/MOSI/MISO | 11/10/9 | proven via touch |
+| Display data path | CE0 or CE1, CS-agnostic | v6.3 blinks on both |
+| Touch CS | 7 (CE1) | proven |
+| Touch PENIRQ | 17 | proven |
+| GPIO24 | pulled high, role unknown | not DC (MHS recipes dead), not BL-gate |
+| DC / RESET GPIOs | none used | KeDei-style in-band control |
+| Backlight | hardwired on | GPIO18/24 ruled out |
